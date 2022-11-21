@@ -11,6 +11,7 @@ import (
 
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/labstack/echo/v4"
+	"github.com/wI2L/jsondiff"
 )
 
 type User struct {
@@ -44,29 +45,70 @@ var (
 
 func main() {
 	r := echo.New()
-
 	r.PUT("/user/update/:id", updateUser)
-	r.POST("/event/add", addEvent)
 	r.GET("/user/:id", getUserByID)
-	r.GET("/patch/:event_type/:event_id/:entity_id", getPatchedByEventID)
+	r.GET("/patch/:patch_type/:event_id/:entity_id", getPatchedByEventID)
 	r.Start(":8080")
 }
 
-func addEvent(c echo.Context) error {
-	e := &Event{}
-	err := c.Bind(e)
+func addEvent(initiator, subject, action string, oldData, newData any) error {
+	rollback, update, err := extractDiffs(oldData, newData)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, err.Error())
+		return err
 	}
 
-	events = append(events, e)
-	return c.JSON(http.StatusCreated, "added")
+	id := int64(len(events) + 1)
+
+	event := &Event{
+		ID:        id,
+		Initiator: initiator,
+		Subject:   subject,
+		Action:    action,
+		Rollback:  rollback,
+		Update:    update,
+	}
+
+	events = append(events, event)
+
+	return nil
+}
+
+func extractDiffs(oldData, newData interface{}) (jsondiff.Patch, jsondiff.Patch, error) {
+	oldSerialized, err := json.Marshal(oldData)
+	if err != nil {
+		return nil, nil, err
+	}
+	newSerialized, err := json.Marshal(newData)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	updatePatch, err := createPatch(oldSerialized, newSerialized)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rollbackPatch, err := createPatch(newSerialized, oldSerialized)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return rollbackPatch, updatePatch, nil
+}
+
+func createPatch(before, after []byte) (jsondiff.Patch, error) {
+	patch, err := jsondiff.CompareJSONOpts(before, after, jsondiff.Invertible())
+	if err != nil {
+		return nil, err
+	}
+
+	return patch, nil
 }
 
 func getUserByID(c echo.Context) error {
-	entityID, err := strconv.Atoi(c.Param("entity_id"))
+	entityID, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		log.Println(err)
+		log.Println("get user by id: ", err)
 		return c.JSON(http.StatusBadRequest, err.Error())
 	}
 
@@ -79,15 +121,15 @@ func getUserByID(c echo.Context) error {
 }
 
 func getPatchedByEventID(c echo.Context) error {
-	patchType := c.Param("event_type")
+	patchType := c.Param("patch_type")
 	eventID, err := strconv.Atoi(c.Param("event_id"))
 	if err != nil {
-		log.Println(err)
+		log.Println("get event_id: ", err)
 		return c.JSON(http.StatusBadRequest, err.Error)
 	}
 	entityID, err := strconv.Atoi(c.Param("entity_id"))
 	if err != nil {
-		log.Println(err)
+		log.Println("get entity_id: ", err)
 		return c.JSON(http.StatusBadRequest, err.Error())
 	}
 	patched, err := getPatched(patchType, int64(eventID), int64(entityID))
@@ -101,13 +143,28 @@ func getPatchedByEventID(c echo.Context) error {
 }
 
 func updateUser(c echo.Context) error {
+	u := &User{}
+	err := c.Bind(u)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, err.Error())
+	}
+
+	old := users[u.ID]
+	users[u.ID] = u
+	fmt.Printf("updated user is: %v\n", u)
+
+	err = addEvent("admin", "some_user", "user_update", old, users[u.ID])
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, err.Error())
+	}
+
 	return c.JSON(http.StatusOK, "updated")
 }
 
 func getPatched(patchType string, eventID, entityID int64) (*User, error) {
 	u, err := getUser(int64(entityID))
 	if err != nil {
-		fmt.Println(err)
+		return nil, err
 	}
 	requiredEvents, err := getEvents(int64(eventID))
 	if err != nil {
@@ -120,11 +177,11 @@ func getPatched(patchType string, eventID, entityID int64) (*User, error) {
 	}
 
 	source := make([]byte, 0)
-	for i, e := range requiredEvents {
-		if i == 0 {
+	for i := len(requiredEvents) - 1; i >= 0; i-- {
+		if i == len(requiredEvents)-1 {
 			source = serialized
 		}
-		source, err = patch(e, patchType, source)
+		source, err = patch(requiredEvents[i], patchType, source)
 		if err != nil {
 			return nil, err
 		}
@@ -176,6 +233,7 @@ func convertToPatch(value interface{}) (jsonpatch.Patch, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	patch, err := jsonpatch.DecodePatch(serialized)
 	if err != nil {
 		return nil, err
@@ -193,7 +251,7 @@ func getUser(id int64) (*User, error) {
 
 func getEvents(id int64) ([]*Event, error) {
 	if int(id) <= len(events)-1 {
-		return events[int(id)-1:], nil
+		return events[int(id):], nil
 	}
 	return nil, errors.New("event with this id not exist")
 }
