@@ -14,41 +14,112 @@ import (
 	"github.com/wI2L/jsondiff"
 )
 
+var (
+	global = time.Now()
+)
+
 type User struct {
-	ID      int64  `json:"id,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Age     int    `json:"age,omitempty"`
-	IsAdult bool   `json:"is_adult,omitempty"`
+	ID      int64     `json:"id,omitempty"`
+	Name    string    `json:"name,omitempty"`
+	Age     int       `json:"age,omitempty"`
+	Bag     *Backpack `json:"bag,omitempty"`
+	IsAdult bool      `json:"is_adult,omitempty"`
+}
+
+type Backpack struct {
+	Phone string `json:"phone,omitempty"`
+	Food  string `json:"food,omitempty"`
+	Gun   string `json:"gun,omitempty"`
 }
 
 type Event struct {
-	ID        int64     `json:"id,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	Initiator string    `json:"initiator,omitempty"`
-	Subject   string    `json:"subject,omitempty"`
-	Action    string    `json:"action,omitempty"`
-	Rollback  any       `json:"rollback,omitempty"`
-	Update    any       `json:"update,omitempty"`
+	ID         int64     `json:"id,omitempty"`
+	CreatedAt  time.Time `json:"created_at,omitempty"`
+	Initiator  string    `json:"initiator,omitempty"`
+	Subject    string    `json:"subject,omitempty"`
+	Action     string    `json:"action,omitempty"`
+	Rollback   any       `json:"rollback,omitempty"`
+	Update     any       `json:"update,omitempty"`
+	IsRollback bool      `json:"is_rollback,omitempty"`
 }
 
 const (
-	rollback = "rollback"
-	update   = "update"
+	RollbackType = "rollback"
+	UpdateType   = "update"
+
+	CreatedAtParam = "created_at"
 )
 
 var (
 	users = map[int64]*User{
-		1: {ID: 1, Name: "John", Age: 16},
+		1: {
+			ID:   1,
+			Name: "John",
+			Age:  16,
+			Bag: &Backpack{
+				Phone: "Poco F3",
+				Food:  "Big tasty",
+				Gun:   "Beretta",
+			}},
 	}
 	events = []*Event{}
 )
 
 func main() {
 	r := echo.New()
+	r.GET("/parse_date", parseDate)
 	r.PUT("/user/update/:id", updateUser)
 	r.GET("/user/:id", getUserByID)
+	r.GET("/events", eventsList)
 	r.GET("/patch/:patch_type/:event_id/:entity_id", getPatchedByEventID)
 	r.Start(":8080")
+}
+
+func parseDate(c echo.Context) error {
+	if c.QueryParam(CreatedAtParam) != "" {
+		fmt.Printf("parseDate query param: %s\n", c.QueryParam(CreatedAtParam))
+		date, err := time.Parse("2006-01-02", c.QueryParam(CreatedAtParam))
+		if err != nil {
+			fmt.Println(err)
+			return c.JSON(http.StatusBadRequest, "parse error")
+		}
+
+		fmt.Printf("parseDate parsed time: %s\n", date)
+		return c.JSON(http.StatusBadRequest, date)
+	}
+
+	return c.JSON(http.StatusBadRequest, "empty param")
+}
+
+func eventsList(c echo.Context) error {
+	filters := make(map[string]string)
+	if c.QueryParam(CreatedAtParam) != "" {
+		filters[CreatedAtParam] = c.QueryParam(CreatedAtParam)
+	}
+
+	events, err := getEventsList(filters)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, "bad request")
+	}
+
+	return c.JSON(http.StatusOK, events)
+}
+
+func getEventsList(filters map[string]string) ([]*Event, error) {
+	date, err := time.Parse(time.RFC3339, filters[CreatedAtParam])
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	fmt.Printf("getEventsList parsed time: %s\n", date)
+	eventsList := []*Event{}
+	for _, e := range events {
+		if e.CreatedAt.Before(date) {
+			continue
+		}
+		eventsList = append(eventsList, e)
+	}
+	return eventsList, nil
 }
 
 func addEvent(initiator, subject, action string, oldData, newData any) error {
@@ -59,8 +130,12 @@ func addEvent(initiator, subject, action string, oldData, newData any) error {
 
 	id := int64(len(events) + 1)
 
+	if len(events) > 5 {
+		global = global.Add(time.Hour * 24)
+	}
 	event := &Event{
 		ID:        id,
+		CreatedAt: global,
 		Initiator: initiator,
 		Subject:   subject,
 		Action:    action,
@@ -68,6 +143,7 @@ func addEvent(initiator, subject, action string, oldData, newData any) error {
 		Update:    update,
 	}
 
+	fmt.Printf("event created at: %v\n", event.CreatedAt.Format(time.RFC3339))
 	events = append(events, event)
 
 	return nil
@@ -138,7 +214,6 @@ func getPatchedByEventID(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, err)
 	}
 
-	log.Println(patched)
 	return c.JSON(http.StatusOK, patched)
 }
 
@@ -217,9 +292,9 @@ func patch(e *Event, patchType string, source []byte) ([]byte, error) {
 func getRequiredPatch(e *Event, patchType string) (interface{}, error) {
 	var requiredPatch interface{}
 	switch patchType {
-	case rollback:
+	case RollbackType:
 		requiredPatch = e.Rollback
-	case update:
+	case UpdateType:
 		requiredPatch = e.Update
 	default:
 		return nil, errors.New("wrong patch type")
@@ -229,10 +304,16 @@ func getRequiredPatch(e *Event, patchType string) (interface{}, error) {
 }
 
 func convertToPatch(value interface{}) (jsonpatch.Patch, error) {
-	serialized, err := json.Marshal(value)
+	// serialized, err := json.Marshal(value)
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	serialized, err := skipAndConvert(value)
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println(string(serialized))
 
 	patch, err := jsonpatch.DecodePatch(serialized)
 	if err != nil {
@@ -267,4 +348,27 @@ func applyPatch(entity []byte, patch jsonpatch.Patch) ([]byte, error) {
 		return nil, err
 	}
 	return patched, err
+}
+
+func skipAndConvert(value interface{}) ([]byte, error) {
+	jdPatch, ok := value.(jsondiff.Patch)
+	if !ok {
+		return nil, errors.New("can't convert to jsonDIFF")
+	}
+
+	updatedPatch := make(jsondiff.Patch, 0)
+	for _, op := range jdPatch {
+		if op.Path[1:len("/bag")] == "bag" {
+			continue
+		}
+
+		updatedPatch = append(updatedPatch, op)
+	}
+
+	serialized, err := json.Marshal(updatedPatch)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialized, nil
 }
